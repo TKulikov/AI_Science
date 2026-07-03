@@ -129,10 +129,10 @@ def llama():
         llm=llm,
         max_triplets_per_chunk=20,
         num_workers=4,
-        allowed_entity_types=["POLITICIAN", "POLITICAL_PARTY"],
-        allowed_relation_types=["PRESIDENT_OF", "MEMBER_OF"],
-        allowed_relation_props=["description"],
-        allowed_entity_props=["description"],
+        allowed_entity_types=None,
+        allowed_relation_types=None,
+        allowed_relation_props=None,
+        allowed_entity_props=None,
     )
 
     dynamic_index_2 = PropertyGraphIndex.from_documents(
