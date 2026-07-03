@@ -1,6 +1,7 @@
 from yandex_ai_studio_sdk import AIStudio
 import os
 from dotenv import load_dotenv
+from llama_index.llms import openai  # we have a problem with connect
 
 load_dotenv()
 folder_id = os.getenv("FOLDER_ID")
