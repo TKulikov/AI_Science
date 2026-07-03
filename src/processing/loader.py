@@ -93,7 +93,7 @@ def extract_path_metadata(path: Path, root: Path):
 
 # определение языка
 CYRILLIC = re.compile(r"[а-яёА-ЯЁ]")
-LATIN = re.compile(r"a-zA-Z")
+LATIN = re.compile(r"[a-zA-Z]")
 
 def detect_language(text: str) -> str:
     # определяем язык текста по соотношению кириллицы и латиницы
@@ -131,9 +131,6 @@ def parse_pdf(path: Path) -> str:
         raise RuntimeError(f"Не удалось прочитать PDF {path}: {e}")
     
 def parse_docx(path: Path) -> str:
-    
-    # TODO все doc файлы конвертировать в docx, чтобы убрать ошибку:
-    # .doc is not a Word file, content type is 'application/vnd.openxmlformats-officedocument.themeManager+xml'
     
     try:
         from docx import Document
