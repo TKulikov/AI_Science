@@ -1,155 +1,110 @@
 import os
-from dotenv import load_dotenv
-from yandex_ai_studio_sdk import AIStudio
-from llama_index.core import Settings
-import wikipedia
-from llama_index.core import Document, PropertyGraphIndex
-from llama_index.core.indices.property_graph import (
-    SimpleLLMPathExtractor,
-    SchemaLLMPathExtractor,
-    DynamicLLMPathExtractor,
-)
-
-load_dotenv()
-folder_id = os.getenv("FOLDER_ID")
-api_key = os.getenv("API_KEY")
-if api_key is None or folder_id is None:
-    print("get env key failed")
-    raise RuntimeError
-
-
-def get_wikipedia_content(title):
-    try:
-        page = wikipedia.page(title)
-        return page.content
-    except wikipedia.exceptions.DisambiguationError as e:
-        print(f"Disambiguation page. Options: {e.options}")
-    except wikipedia.exceptions.PageError:
-        print(f"Page '{title}' does not exist.")
-    return None
-
-
 from typing import Any
-from yandex_ai_studio_sdk import AIStudio  # Официальный SDK Яндекса
+from yandex_ai_studio_sdk import AIStudio
+from dotenv import load_dotenv
 
+# Компоненты ядра LlamaIndex
+from llama_index.core import SimpleDirectoryReader, PropertyGraphIndex, Settings
 from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
 
+# Официальные эмбеддинги Яндекса
+from llama_index.embeddings.yandexgpt import YandexGPTEmbedding
 
+
+# 1. СОЗДАЕМ ОБЕРТКУ ДЛЯ YANDEX AI STUDIO SDK (Генерация)
 class YandexAIStudioLlamaIndex(CustomLLM):
     api_key: str
     folder_id: str
     model_name: str = "yandexgpt"
-    temperature: float = 0.6
+    temperature: float = (
+        0.2  # Низкая температура важна для точного извлечения сущностей
+    )
 
-    # Внутренний объект официального SDK (не участвует в pydantic-валидации LlamaIndex)
     _sdk: Any = None
 
     def __init__(self, **data: Any):
         super().__init__(**data)
-        # Инициализируем официальный SDK Яндекса
-        self._sdk = AIStudio(
-            folder_id=self.folder_id,
-            auth=self.api_key,  # SDK сам разберется с типами ключей (API-Key, IAM и т.д.)
-        )
+        self._sdk = AIStudio(folder_id=self.folder_id, auth=self.api_key)
 
     @property
     def metadata(self) -> LLMMetadata:
-        """Метаданные, которые LlamaIndex запрашивает у модели."""
         return LLMMetadata(
             context_window=8192, num_output=2000, model_name=self.model_name
         )
 
     @llm_completion_callback()
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
-        # Используем родные методы официального SDK Яндекса
-        model = self._sdk.models.completions(self.model_name)
-        model = model.configure(temperature=self.temperature)
-
-        # Запускаем генерацию текста
+        model = self._sdk.models.completions(self.model_name).configure(
+            temperature=self.temperature
+        )
         result = model.run(prompt)
-
-        # Извлекаем текст ответа из генератора альтернатив SDK
-        text_response = ""
-        for alternative in result:
-            text_response += str(alternative)
-
+        text_response = "".join([str(alternative) for alternative in result])
         return CompletionResponse(text=text_response)
 
     @llm_completion_callback()
     def stream_complete(self, prompt: str, **kwargs: Any):
-        raise NotImplementedError("Стриминг пока не реализован")
+        raise NotImplementedError()
 
 
-# ==========================================
-# ИСПОЛЬЗОВАНИЕ В ВАШЕМ ПРОЕКТЕ
-# ==========================================
+load_dotenv()
+# 2. НАСТРОЙКА КЛЮЧЕЙ И КОНФИГУРАЦИИ
+YANDEX_API_KEY = os.getenv("API_KEY")
+FOLDER_ID = os.getenv("FOLDER_ID")
+
+# Инициализируем LLM (через официальный SDK Яндекса)
+llm_model = YandexAIStudioLlamaIndex(
+    api_key=YANDEX_API_KEY,
+    folder_id=FOLDER_ID,
+    model_name="yandexgpt",  # Для сложных графов лучше использовать базовый yandexgpt, а не lite
+)
+
+# Инициализируем Эмбеддинги (через официальный коннектор LlamaIndex)
+embed_model = YandexGPTEmbedding(api_key=YANDEX_API_KEY, folder_id=FOLDER_ID)
+
+# Записываем всё в глобальные настройки LlamaIndex
+Settings.llm = llm_model
+Settings.embed_model = embed_model
 
 
-# Создаем обертку над официальным SDK
-def test():
-    llm = YandexAIStudioLlamaIndex(
-        api_key=api_key,
-        folder_id=folder_id,
-        model_name="yandexgpt",  # можно поменять на yandexgpt-lite
-    )
+# 3. ЗАГРУЗКА ДОКУМЕНТОВ И ПОСТРОЕНИЕ ГРАФА
+def create_knowledge_graph(data_dir: str):
+    print("Загрузка документов...")
+    # Читаем все файлы (pdf, txt, docx) из указанной директории
+    documents = SimpleDirectoryReader(data_dir, recursive=True).load_data()
 
-    # Передаем в глобальные настройки LlamaIndex
-    Settings.llm = llm
+    print("Построение ассоциативного графа (PropertyGraph)...")
+    # PropertyGraphIndex автоматически отправляет куски текста в LLM,
+    # просит извлечь сущности/связи и строит структуру графа
+    index = PropertyGraphIndex.from_documents(documents, show_progress=True)
 
-    # Теперь LlamaIndex прозрачно вызывает официальный SDK Яндекса под капотом!
-    try:
-        response = Settings.llm.complete("Привет! Ты работаешь через официальный SDK?")
-        print("Ответ YandexGPT:")
-        print(response)
-    except Exception as e:
-        print(f"Ошибка: {e}")
+    # Сохраняем граф локально, чтобы не строить его заново при каждом запуске
+    index.storage_context.persist(persist_dir="./storage_graph")
+    print("Граф успешно построен и сохранен в папку ./storage_graph")
+    return index
 
 
-def llama():
-
-    llm = YandexAIStudioLlamaIndex(
-        api_key=api_key,
-        folder_id=folder_id,
-        model_name="yandexgpt",  # можно поменять на yandexgpt-lite
-    )
-    Settings.llm = llm
-    Settings.chunk_size = 2048
-    Settings.chunk_overlap = 20
-    wiki_title = "Barack Obama"
-    content = get_wikipedia_content(wiki_title)
-
-    if content:
-        document = Document(text=content, metadata={"title": wiki_title})
-        print(f"Fetched content for '{wiki_title}' (length: {len(content)} characters)")
-    else:
-        print("Failed to fetch Wikipedia content.")
-
-    kg_extractor = DynamicLLMPathExtractor(
-        llm=llm,
-        max_triplets_per_chunk=20,
-        num_workers=4,
-        allowed_entity_types=None,
-        allowed_relation_types=None,
-        allowed_relation_props=None,
-        allowed_entity_props=None,
-    )
-
-    dynamic_index_2 = PropertyGraphIndex.from_documents(
-        [document],
-        llm=llm,
-        embed_kg_nodes=False,
-        kg_extractors=[kg_extractor],
-        show_progress=True,
-    )
-
-    dynamic_index_2.property_graph_store.save_networkx_graph(
-        name="./DynamicGraph_2.html"
-    )
-    dynamic_index_2.property_graph_store.get_triplets(
-        entity_names=["Barack Obama", "Obama"]
-    )[:5]
-
-
+# Вызов функции (создайте папку 'my_documents' и положите туда файлы)
 if __name__ == "__main__":
-    llama()
+    os.makedirs("./my_documents", exist_ok=True)
+
+    # Если граф еще не создан, создаем его
+    if not os.path.exists("./storage_graph"):
+        index = create_knowledge_graph("./my_documents")
+    else:
+        # Если уже создан — просто загружаем из памяти
+        from llama_index.core import StorageContext, load_index_from_storage
+
+        print("Загрузка существующего графа из памяти...")
+        storage_context = StorageContext.from_defaults(persist_dir="./storage_graph")
+        index = PropertyGraphIndex.from_storage(storage_context)
+
+    # 4. ЗАПРОСЫ К ГРАФУ АССОЦИАЦИЙ
+    # Создаем поисковый движок на базе графа
+    query_engine = index.as_query_engine()
+
+    response = query_engine.query(
+        "Какие ключевые взаимосвязи между объектами описаны в документах?"
+    )
+    print("\nОтвет системы:")
+    print(response)
