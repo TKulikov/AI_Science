@@ -2,3 +2,9 @@ yandex-ai-studio-sdk[langchain]
 llama_index
 pyvis
 wikipedia
+
+pypdf
+cryptography
+pycryptodome 
+docx
+python-docx
