@@ -1,21 +1,24 @@
 """
 Загрузка документов через SimpleDirectoryReader
 
-SimpleDirectoryReader сам парсит PDF/DOCX/TXT рекурсивно,
-но он не знает про структуру папок, поэтому year подставляем через хук 
-file_metadata, а language дописываем после загрузки
+SimpleDirectoryReader сам парсит PDF/DOCX/TXT рекурсивно
+Возвращает список LlamaIndex Document, готовый для store.build_all_indexes
 """
 
+import logging
 import re
 from pathlib import Path
 from typing import Optional
 
 from llama_index.core import SimpleDirectoryReader, Document
 
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
 
 # year из структуры пути
 def _parse_year_from_path(path_str: str) -> Optional[int]:
-    # ищет 4-значный год в компонентах пути
+
+    # ищетм 4-значный год в компонентах пути
     for part in Path(path_str).parts:
         m = re.match(r"(19|20)\d{2}", part)
         if m:
@@ -24,38 +27,46 @@ def _parse_year_from_path(path_str: str) -> Optional[int]:
 
 
 def _file_metadata(path_str: str) -> dict:
-    # хук
+    # Хук SimpleDirectoryReader
     return {
         "doc_path": path_str,
         "year": _parse_year_from_path(path_str),
     }
 
 
-# определение языка
-CYRILLIC = re.compile(r"[а-яёА-ЯЁ]")
-LATIN = re.compile(r"[a-zA-Z]")
+# Определение языка
+_CYRILLIC = re.compile(r"[а-яёА-ЯЁ]")
+_LATIN = re.compile(r"[a-zA-Z]")
+
 
 def detect_language(text: str) -> str:
-    cyr = len(CYRILLIC.findall(text))
-    lat = len(LATIN.findall(text))
-    
+
+    sample = text[:3000]
+    cyr = len(_CYRILLIC.findall(sample))
+    lat = len(_LATIN.findall(sample))
     total = cyr + lat
     if total == 0:
         return "ru"
-    
     rat = cyr / total
     if rat > 0.7:
         return "ru"
     if rat < 0.3:
         return "en"
-    
-    # иначе непонятно
     return "mixed"
 
 
-# загрузка документов
+# entrypoint
 def load_documents(data_dir: str | Path) -> list[Document]:
+    """
+    Загружает все документы из директории
 
+    Шаги:
+      1. SimpleDirectoryReader парсит файлы + подставляет year через хук
+      2. Дописываем language по тексту
+      3. Прячем служебные поля из эмбеддинга и LLM-контекста
+
+    Возвращает список Document для store.build_all_indexes.
+    """
     data_dir = Path(data_dir)
     if not data_dir.exists():
         raise FileNotFoundError(f"Директория не найдена: {data_dir}")
@@ -67,17 +78,36 @@ def load_documents(data_dir: str | Path) -> list[Document]:
         errors="ignore",
         raise_on_error=False,
     )
-    documents = reader.load_data(show_progress=True)
+
+    documents = []
+    skipped = []
+    input_files = reader.input_files
+
+    from tqdm import tqdm
+    for fpath in tqdm(input_files, desc="Загрузка файлов"):
+        try:
+            docs = reader.load_file(
+                input_file=fpath,
+                file_metadata=_file_metadata,
+                file_extractor=reader.file_extractor,
+                errors="ignore",
+                raise_on_error=False,
+            )
+            documents.extend(docs)
+        except Exception as e:
+            skipped.append(f"{Path(fpath).name}: {type(e).__name__}")
+            continue
+
+    if skipped:
+        print(f"Пропущено файлов: {len(skipped)}")
 
     # пост-обработка
     for doc in documents:
         doc.metadata["language"] = detect_language(doc.text)
 
-        # оставляем только нужное: doc_path, year, language
         keep = {"doc_path", "year", "language"}
         doc.metadata = {k: v for k, v in doc.metadata.items() if k in keep}
 
-        # служебное поле
         doc.excluded_embed_metadata_keys = ["doc_path"]
         doc.excluded_llm_metadata_keys = ["doc_path"]
 
