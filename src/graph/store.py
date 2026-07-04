@@ -53,7 +53,7 @@ VECTOR_PERSIST_DIR = Path("data/vector_store")
 NUM_WORKERS = int(os.getenv("KG_NUM_WORKERS", "8"))
 MAX_TRIPLETS = int(os.getenv("KG_MAX_TRIPLETS", "15"))
 EMBED_KG_NODES = os.getenv("KG_EMBED_NODES", "false").lower() == "true"
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "2048"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "128"))
 MICRO_BATCH_SIZE = 5
 
@@ -113,7 +113,7 @@ def _init() -> YandexLLM:
     llm = _make_llm()
     Settings.llm = llm
     Settings.embed_model = _make_embed()
-    Settings.chunk_size = 1000  # Hardcode
+    Settings.chunk_size = CHUNK_SIZE  # Hardcode
     Settings.chunk_overlap = CHUNK_OVERLAP
     return llm
 
@@ -148,7 +148,7 @@ def get_yandex_tokens_count(text: str) -> int:
 def _split(documents: List[Document]) -> list:
     from tqdm import tqdm
 
-    splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     nodes = []
     for doc in tqdm(documents, desc="Нарезка", unit="doc", leave=False):
         nodes.extend(splitter.get_nodes_from_documents([doc]))
@@ -195,34 +195,65 @@ def build_all_indexes_streaming(
             micro_nodes = nodes[j : j + MICRO_BATCH_SIZE]
 
             # 1. СТАБИЛЬНАЯ ОТПРАВКА В ГРАФ С ЗАЩИТОЙ ОТ ПАДЕНИЯ ПО КВОТАМ
+
+            # 2. ОТПРАВКА В ВЕКТОРНЫЙ ИНДЕКС С АВТО-ДРОБЛЕНИЕМ ПРОБЛЕМНЫХ ЧАНКОВ
             for single_node in micro_nodes:
-                success = False
+                success_vector = False
                 retries = 0
 
-                while not success:
+                while not success_vector:
                     try:
-                        graph.insert_nodes(
-                            [single_node],
-                            kg_extractors=[kg_extractor],
-                            embed_kg_nodes=False,
-                            transformations=[],
-                        )
-                        success = True
-
-                        # Маленькая микро-пауза (0.3 сек) защитит от мгновенного всплеска RPS
-                        time.sleep(0.3)
-
+                        vector.insert_nodes([single_node], transformations=[])
+                        success_vector = True
+                        time.sleep(0.1)
                     except Exception as e:
-                        retries += 1
-                        # Если поймали ошибку сессии или лимитов токенов Яндекса
-                        print(
-                            f"\n[Внимание] Яндекс перегружен или исчерпан минутный лимит TPM. Ошибка: {e}"
-                        )
-                        wait_time = min(30 * retries, 60)  # Спим 30 секунд, затем 60
-                        print(
-                            f"Ожидаем {wait_time} сек. для сброса лимитов токенов (Попытка {retries})..."
-                        )
-                        time.sleep(wait_time)
+                        err_msg = str(e)
+
+                        # Проверяем, связана ли ошибка со слишком большим размером конкретного чанка
+                        if (
+                            "number of input tokens must be no more than 2048"
+                            in err_msg
+                        ):
+                            print(
+                                f"\n[Критический чанк] Обнаружен слишком плотный фрагмент. Авто-разбиение..."
+                            )
+
+                            # Извлекаем исходный текст из «раздувшейся» ноды
+                            node_text = single_node.get_content()
+
+                            # Грубо делим текст пополам по символам, чтобы гарантированно пролезть в лимит
+                            mid_point = len(node_text) // 2
+                            part1_text = node_text[:mid_point]
+                            part2_text = node_text[mid_point:]
+
+                            # Создаем две новые мелкие ноды на замену старой
+                            from llama_index.core.schema import TextNode
+
+                            node_part1 = TextNode(
+                                text=part1_text, metadata=single_node.metadata
+                            )
+                            node_part2 = TextNode(
+                                text=part2_text, metadata=single_node.metadata
+                            )
+
+                            # Поочередно вставляем их в векторный индекс
+                            vector.insert_nodes([node_part1], transformations=[])
+                            vector.insert_nodes([node_part2], transformations=[])
+
+                            print(
+                                "-> Плотный чанк успешно разделен и добавлен по частям."
+                            )
+                            success_vector = True  # Выходим из цикла для этой ноды
+
+                        else:
+                            # Если это обычная сетевая ошибка или временный лимит RPM/TPM
+                            retries += 1
+                            print(
+                                f"\n[Внимание] Ошибка эмбеддингов Яндекса: {err_msg}."
+                            )
+                            wait_time = min(30 * retries, 60)
+                            print(f"Ждем {wait_time} сек. перед повторной попыткой...")
+                            time.sleep(wait_time)
 
             # 2. ОТПРАВКА В ВЕКТОРНЫЙ ИНДЕКС
             for single_node in micro_nodes:
