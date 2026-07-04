@@ -2,6 +2,7 @@ data/graph_store/
 data/processed/
 data/raw/
 data/vector_store/
+data/raw_test/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

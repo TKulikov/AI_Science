@@ -1,20 +1,17 @@
 """
-Хранилище графа и векторного индекса на LlamaIndex и yandex-ai-studio-sdk
+Хранилище графа и векторного индекса на LlamaIndex
 
-Весь стек идёт через один API-ключ Яндекса:
-  - YandexAIStudioLlamaIndex (обёртка над SDK, с таймаутом)
-  - YandexGPTEmbedding (официальный коннектор LlamaIndex)
+Стек:
+  - LLM в Ollama (Qwen2.5)
+  - Embeddings с HuggingFace multilingual-e5 (ru+en)
 
-Два индекса:
-  - PropertyGraphIndex это триплеты через DynamicLLMPathExtractor
-  - VectorStoreIndex это семантический поиск по эмбеддингам Яндекса
-
+Граф строится не поштучно, а по КЛАСТЕРАМ близких фрагментов.
 Точка входа: build_all_indexes
 """
 
 import os
 from pathlib import Path
-from typing import Any, List
+from typing import List
 
 from dotenv import load_dotenv
 
@@ -23,93 +20,74 @@ from llama_index.core import (
     Document,
     PropertyGraphIndex,
     VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
 )
 from llama_index.core.indices.property_graph import DynamicLLMPathExtractor
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
-from llama_index.core.llms.callbacks import llm_completion_callback
 
-from llama_index.embeddings.yandexgpt import YandexGPTEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from yandex_ai_studio_sdk import AIStudio
-
-# КОНФИГУРАЦИЯ 
+from src.graph.clustering import cluster_pipeline
 
 load_dotenv()
-
-FOLDER_ID = os.getenv("FOLDER_ID")
-API_KEY = os.getenv("API_KEY")
 
 GRAPH_PERSIST_DIR = Path("data/graph_store")
 VECTOR_PERSIST_DIR = Path("data/vector_store")
 
-# нарезка документов на nodes при индексации
-CHUNK_SIZE = 2048
-CHUNK_OVERLAP = 128
+# LLM (Ollama / Qwen)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300.0"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
+
+# Эмбеддинги (multilingual-e5-base) 
+EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
+EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cuda") # "cpu" если нет GPU
+
+# Граф 
+NUM_WORKERS = int(os.getenv("KG_NUM_WORKERS", "4")) # параллельные вызовы Ollama
+MAX_TRIPLETS_PER_CHUNK = int(os.getenv("KG_MAX_TRIPLETS", "15"))
+EMBED_KG_NODES = os.getenv("KG_EMBED_NODES", "false").lower() == "true"
+
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "2048"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "128"))
 
 
-# LLM обёртка над официальным yandex-ai-studio-sdk
-class YandexAIStudioLlamaIndex(CustomLLM):
-    api_key: str
-    folder_id: str
-    model_name: str = "yandexgpt"
-    temperature: float = 0.3
-    timeout: float = 60.0 # секунды 
-
-    _sdk: Any = None
-
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        self._sdk = AIStudio(folder_id=self.folder_id, auth=self.api_key)
-
-    @property
-    def metadata(self) -> LLMMetadata:
-        return LLMMetadata(
-            context_window=8192,
-            num_output=2000,
-            model_name=self.model_name,
-        )
-
-    @llm_completion_callback()
-    def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
-        model = self._sdk.models.completions(self.model_name)
-        
-        model = model.configure(temperature=self.temperature)
-        result = model.run(prompt, timeout=self.timeout)
-        
-        parts: list[str] = []
-        for alt in result:
-            text = getattr(alt, "text", None)
-            parts.append(text if text is not None else str(alt))
-        return CompletionResponse(text="".join(parts))
-
-    @llm_completion_callback()
-    def stream_complete(self, prompt: str, **kwargs: Any):
-        raise NotImplementedError("Стриминг не используется при индексации")
-
-
-# глобальные settings 
-def _init_settings() -> YandexAIStudioLlamaIndex:
-    llm = YandexAIStudioLlamaIndex(
-        api_key=API_KEY,
-        folder_id=FOLDER_ID,
-        model_name="yandexgpt",
-        temperature=0.3,
+# Фабрики LLM и эмбеддингов
+def _make_llm() -> Ollama:
+    return Ollama(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        request_timeout=OLLAMA_TIMEOUT,
+        temperature=OLLAMA_TEMPERATURE,
     )
+
+
+def _make_embed_model() -> HuggingFaceEmbedding:
+    return HuggingFaceEmbedding(
+        model_name=EMBED_MODEL,
+        device=EMBED_DEVICE,
+    )
+
+
+def _init_settings() -> Ollama:
+    """настраивает глобальные Settings и возвращает LLM для экстрактора"""
+    llm = _make_llm()
     Settings.llm = llm
-    Settings.embed_model = YandexGPTEmbedding(
-        api_key=API_KEY, folder_id=FOLDER_ID)
+    Settings.embed_model = _make_embed_model()
     Settings.chunk_size = CHUNK_SIZE
     Settings.chunk_overlap = CHUNK_OVERLAP
     return llm
 
 
-# экстрактор триплетов
-def _make_path_extractor(llm: YandexAIStudioLlamaIndex) -> DynamicLLMPathExtractor:
+# Экстрактор триплетов
+def _make_path_extractor(llm: Ollama) -> DynamicLLMPathExtractor:
     return DynamicLLMPathExtractor(
         llm=llm,
-        max_triplets_per_chunk=10, # 20
-        num_workers=12, # думаю можно меньше
+        max_triplets_per_chunk=MAX_TRIPLETS_PER_CHUNK,
+        num_workers=NUM_WORKERS,
         allowed_entity_types=None,
         allowed_relation_types=None,
         allowed_relation_props=None,
@@ -117,29 +95,39 @@ def _make_path_extractor(llm: YandexAIStudioLlamaIndex) -> DynamicLLMPathExtract
     )
 
 
-# построение графового индекса
+# Построение графового индекса
 def build_graph_index(
     documents: List[Document],
     persist_dir: Path = GRAPH_PERSIST_DIR,
 ) -> PropertyGraphIndex:
     """
-    Строим PropertyGraphIndex. LLM читает каждый node и извлекает триплеты
-    при embed_kg_nodes=True узлы графа эмбеддятся
+    строит PropertyGraphIndex по кластерам близких фрагментов
 
-    Документы режем на nodes через SentenceSplitter ПЕРЕД экстрактором 
-    Иначе DynamicLLMPathExtractor шлёт документ целиком в
-    YandexGPT и упирается в лимит токенов.
+    Поток:
+      1. Режем документы на nodes (SentenceSplitter)
+      2. Кластеризуем близкие nodes (clustering.cluster_pipeline)
+      3. Каждая группа это один вызов LLM для извлечения триплетов
     """
     llm = _init_settings()
 
+    # 1.
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     nodes = splitter.get_nodes_from_documents(documents)
-    print(f"Документов: {len(documents)}, nodes: {len(nodes)}")
+    print(f"Документов: {len(documents)} nodes: {len(nodes)}")
 
+    # 2.
+    embed_model = Settings.embed_model
+
+    def _embed_batch(texts: list[str]) -> list[list[float]]:
+        return embed_model.get_text_embedding_batch(texts, show_progress=False)
+
+    group_nodes = cluster_pipeline(nodes, _embed_batch)
+
+    # 3.
     index = PropertyGraphIndex(
-        nodes=nodes,
+        nodes=group_nodes,
         llm=llm,
-        embed_kg_nodes=True,
+        embed_kg_nodes=EMBED_KG_NODES,
         kg_extractors=[_make_path_extractor(llm)],
         show_progress=True,
     )
@@ -158,7 +146,7 @@ def build_graph_index(
     return index
 
 
-# построение векторного индекса
+# Построение векторного индекса
 def build_vector_index(
     documents: List[Document],
     persist_dir: Path = VECTOR_PERSIST_DIR,
@@ -176,14 +164,34 @@ def build_vector_index(
     return index
 
 
-# TODO: загрузка индексов с диска
-# PropertyGraphIndex и VectorStoreIndex
-# TODO: уменьшить время работы LLM
+# Загрузка индексов с диска
+def load_graph_index(persist_dir: Path = GRAPH_PERSIST_DIR) -> PropertyGraphIndex:
+    _init_settings()
+    if not persist_dir.exists():
+        raise FileNotFoundError(
+            f"Граф не найден: {persist_dir}. Сначала запустите index.py"
+        )
+    storage_ctx = StorageContext.from_defaults(persist_dir=str(persist_dir))
+    return load_index_from_storage(storage_ctx)
+
+
+def load_vector_index(persist_dir: Path = VECTOR_PERSIST_DIR) -> VectorStoreIndex:
+    _init_settings()
+    if not persist_dir.exists():
+        raise FileNotFoundError(
+            f"Векторный индекс не найден: {persist_dir}. Сначала запустите index.py"
+        )
+    storage_ctx = StorageContext.from_defaults(persist_dir=str(persist_dir))
+    return load_index_from_storage(storage_ctx)
+
 
 # entrypoint
 def build_all_indexes(
     documents: List[Document],
 ) -> tuple[PropertyGraphIndex, VectorStoreIndex]:
+    """
+    Возвращает (graph_index, vector_index).
+    """
     print(f"Документов на входе: {len(documents)}")
 
     print("Строим граф (LLM извлекает триплеты)...")
@@ -192,5 +200,5 @@ def build_all_indexes(
     print("Строим векторный индекс...")
     vector_index = build_vector_index(documents)
 
-    print("Оба индекса построены и сохранены!")
+    print("Оба индекса построены и сохранены")
     return graph_index, vector_index

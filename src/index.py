@@ -16,7 +16,7 @@ from src.graph.store import build_all_indexes
 
 def main():
 
-    DATA_DIR = "data/raw"
+    DATA_DIR = "data/raw_test"
 
     documents = load_documents(DATA_DIR)
     if not documents:
