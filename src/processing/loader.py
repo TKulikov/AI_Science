@@ -1,11 +1,18 @@
 """
-Загрузка документов через SimpleDirectoryReader
+Загрузка документов: предфильтр + родной параллельный load_data
 
-SimpleDirectoryReader сам парсит PDF/DOCX/TXT рекурсивно
-Возвращает список LlamaIndex Document, готовый для store.build_all_indexes
+Стратегия:
+  1. Быстрый предфильтр, где мы отсеиваем сканы (PDF без текста) и гиганты,
+     не парся их целиком
+  2. Чистый список файлов в SimpleDirectoryReader.load_data(num_workers),
+     который грузит параллельно
+  3. Пост-обработка: язык по тексту + чистка метаданных
+
+year подставляется через хук file_metadata, language после загрузки.
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -14,24 +21,15 @@ from llama_index.core import SimpleDirectoryReader, Document
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-
-# PDF-ридер с лимитом страниц для больших файлов
-import os as _os
-
-_PDF_SIZE_LIMIT_MB = float(_os.getenv("PDF_PAGE_LIMIT_ABOVE_MB", "10"))
-_MAX_PDF_PAGES = int(_os.getenv("MAX_PDF_PAGES", "50"))
-
-def _read_pdf_limited(file_path, max_pages: int) -> str:
-    """читает первые max_pages страниц PDF"""
-    from pypdf import PdfReader
-    reader = PdfReader(str(file_path))
-    pages = reader.pages[:max_pages]
-    return "\n".join((p.extract_text() or "") for p in pages)
+# Параметры
+NUM_WORKERS = int(os.getenv("LOAD_NUM_WORKERS", "4"))
+SCAN_PROBE_PAGES = int(os.getenv("SCAN_PROBE_PAGES", "3"))
+SCAN_MIN_CHARS_PER_PAGE = int(os.getenv("SCAN_MIN_CHARS_PER_PAGE", "50"))
+MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "60"))
 
 
 # year из структуры пути
 def _parse_year_from_path(path_str: str) -> Optional[int]:
-    # ищет 4-значный год в компонентах пути
     for part in Path(path_str).parts:
         m = re.match(r"(19|20)\d{2}", part)
         if m:
@@ -40,11 +38,7 @@ def _parse_year_from_path(path_str: str) -> Optional[int]:
 
 
 def _file_metadata(path_str: str) -> dict:
-    # Хук SimpleDirectoryReader
-    return {
-        "doc_path": path_str,
-        "year": _parse_year_from_path(path_str),
-    }
+    return {"doc_path": path_str, "year": _parse_year_from_path(path_str)}
 
 
 # Определение языка
@@ -67,81 +61,85 @@ def detect_language(text: str) -> str:
     return "mixed"
 
 
+# Предфильтр: детектор сканов
+def _is_scanned_pdf(file_path: Path) -> bool:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(file_path))
+        probe = reader.pages[:SCAN_PROBE_PAGES]
+        if not probe:
+            return False
+        total = sum(len((p.extract_text() or "")) for p in probe)
+        return (total / len(probe)) < SCAN_MIN_CHARS_PER_PAGE
+    except Exception:
+        return False
+
+
+def _prefilter(files: list[Path]) -> tuple[list[Path], list[str]]:
+    keep = []
+    skipped = []
+
+    from tqdm import tqdm
+    for fp in tqdm(files, desc="Предфильтр"):
+        size_mb = fp.stat().st_size / 1e6
+
+        if MAX_FILE_MB > 0 and size_mb > MAX_FILE_MB:
+            skipped.append(f"{fp.name}: гигант ({size_mb:.0f}МБ)")
+            continue
+
+        if fp.suffix.lower() == ".pdf" and _is_scanned_pdf(fp):
+            skipped.append(f"{fp.name}: скан (нет текста)")
+            continue
+
+        keep.append(fp)
+
+    return keep, skipped
+
+
 # entrypoint
 def load_documents(data_dir: str | Path) -> list[Document]:
-    """
-    Загружает все документы из директории
-
-    Шаги:
-      1. SimpleDirectoryReader парсит файлы + подставляет year через хук
-      2. Дописываем language по тексту
-      3. Прячем служебные поля из эмбеддинга и LLM-контекста
-
-    Возвращает список Document для store.build_all_indexes.
-    """
     data_dir = Path(data_dir)
     if not data_dir.exists():
         raise FileNotFoundError(f"Директория не найдена: {data_dir}")
 
-    reader = SimpleDirectoryReader(
+    # Собираем все файлы через reader (он знает поддерживаемые форматы)
+    base_reader = SimpleDirectoryReader(
         input_dir=str(data_dir),
         recursive=True,
         file_metadata=_file_metadata,
         errors="ignore",
         raise_on_error=False,
     )
+    all_files = [Path(f) for f in base_reader.input_files]
+    print(f"Найдено файлов: {len(all_files)}")
 
-    documents = []
-    skipped = []
-    input_files = reader.input_files
+    # 1. Предфильтр
+    good_files, skipped = _prefilter(all_files)
+    print(f"После фильтра: {len(good_files)} годных, {len(skipped)} отсеяно")
 
-    import time
+    if not good_files:
+        print("Нет файлов для загрузки после фильтра")
+        return []
 
-    from tqdm import tqdm
-    pbar = tqdm(input_files, desc="Загрузка файлов")
-    for fpath in pbar:
-        fp = Path(fpath)
-        size_mb = fp.stat().st_size / 1e6
-        pbar.set_postfix_str(f"{fp.name[:30]} ({size_mb:.1f}МБ)")
-        t0 = time.time()
+    # 2. Родной параллельный load_data на чистом списке
+    reader = SimpleDirectoryReader(
+        input_files=[str(f) for f in good_files],
+        file_metadata=_file_metadata,
+        errors="ignore",
+        raise_on_error=False,
+    )
+    documents = reader.load_data(show_progress=True, num_workers=NUM_WORKERS)
 
-        try:
-            if fp.suffix.lower() == ".pdf" and size_mb > _PDF_SIZE_LIMIT_MB:
-                text = _read_pdf_limited(fp, _MAX_PDF_PAGES)
-                if text.strip():
-                    meta = _file_metadata(str(fp))
-                    documents.append(Document(text=text, metadata=meta))
-                    print(f"Большой PDF ({size_mb:.0f}МБ): "
-                          f"прочитаны первые {_MAX_PDF_PAGES} стр. - {fp.name}")
-            else:
-                docs = reader.load_file(
-                    input_file=fpath,
-                    file_metadata=_file_metadata,
-                    file_extractor=reader.file_extractor,
-                    errors="ignore",
-                    raise_on_error=False,
-                )
-                documents.extend(docs)
-
-            dt = time.time() - t0
-            if dt > 15:
-                print(f"Медленный файл ({dt:.0f}с): {fp.name}")
-        except Exception as e:
-            skipped.append(f"{fp.name}: {type(e).__name__}")
-            continue
+    # 3. пост-обработка
+    for doc in documents:
+        doc.metadata["language"] = detect_language(doc.text)
+        keep = {"doc_path", "year", "language"}
+        doc.metadata = {k: v for k, v in doc.metadata.items() if k in keep}
+        doc.excluded_embed_metadata_keys = ["doc_path"]
+        doc.excluded_llm_metadata_keys = ["doc_path"]
 
     if skipped:
         print(f"Пропущено файлов: {len(skipped)}")
-
-    # пост-обработка
-    for doc in documents:
-        doc.metadata["language"] = detect_language(doc.text)
-
-        keep = {"doc_path", "year", "language"}
-        doc.metadata = {k: v for k, v in doc.metadata.items() if k in keep}
-
-        doc.excluded_embed_metadata_keys = ["doc_path"]
-        doc.excluded_llm_metadata_keys = ["doc_path"]
 
     print(f"Загружено документов: {len(documents)}")
     return documents
