@@ -4,7 +4,7 @@
 Раскрывает .zip, .rar и склеенные многотомники (.001/.002/...) прямо
 в те же папки
 
-Запуск: python scripts/extract_archives.py --data-dir data/raw
+Запуск: python src/processing/extract_archives.py --data-dir data/raw
 Требует: pip install rarfile
 """
 import argparse

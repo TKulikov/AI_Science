@@ -1,31 +1,24 @@
-"""
-Скрипт индексации
-
-Запуск:
-    python src/index.py
-"""
-
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.processing.loader import load_documents
-from src.graph.store import build_all_indexes
+from src.graph.store import build_all_indexes_streaming, GRAPH_PERSIST_DIR, VECTOR_PERSIST_DIR
 
 
-def main():
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", type=Path, default=Path("data/raw"))
+    args = ap.parse_args()
 
-    DATA_DIR = "data/raw"
-
-    documents = load_documents(DATA_DIR)
-    if not documents:
-        print("Нет документов для индексации")
+    if not args.data_dir.exists():
+        print(f"Директория не найдена: {args.data_dir}")
         sys.exit(1)
 
-    graph_index, vector_index = build_all_indexes(documents)
-
-    print("Готово!")
+    build_all_indexes_streaming(str(args.data_dir))
+    print(f"Граф: {GRAPH_PERSIST_DIR}")
+    print(f"Вектор: {VECTOR_PERSIST_DIR}")
 
 
 if __name__ == "__main__":
