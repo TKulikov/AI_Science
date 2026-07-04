@@ -15,10 +15,23 @@ from llama_index.core import SimpleDirectoryReader, Document
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
+# PDF-ридер с лимитом страниц для больших файлов
+import os as _os
+
+_PDF_SIZE_LIMIT_MB = float(_os.getenv("PDF_PAGE_LIMIT_ABOVE_MB", "10"))
+_MAX_PDF_PAGES = int(_os.getenv("MAX_PDF_PAGES", "50"))
+
+def _read_pdf_limited(file_path, max_pages: int) -> str:
+    """читает первые max_pages страниц PDF"""
+    from pypdf import PdfReader
+    reader = PdfReader(str(file_path))
+    pages = reader.pages[:max_pages]
+    return "\n".join((p.extract_text() or "") for p in pages)
+
+
 # year из структуры пути
 def _parse_year_from_path(path_str: str) -> Optional[int]:
-
-    # ищетм 4-значный год в компонентах пути
+    # ищет 4-значный год в компонентах пути
     for part in Path(path_str).parts:
         m = re.match(r"(19|20)\d{2}", part)
         if m:
@@ -40,7 +53,6 @@ _LATIN = re.compile(r"[a-zA-Z]")
 
 
 def detect_language(text: str) -> str:
-
     sample = text[:3000]
     cyr = len(_CYRILLIC.findall(sample))
     lat = len(_LATIN.findall(sample))
@@ -83,19 +95,39 @@ def load_documents(data_dir: str | Path) -> list[Document]:
     skipped = []
     input_files = reader.input_files
 
+    import time
+
     from tqdm import tqdm
-    for fpath in tqdm(input_files, desc="Загрузка файлов"):
+    pbar = tqdm(input_files, desc="Загрузка файлов")
+    for fpath in pbar:
+        fp = Path(fpath)
+        size_mb = fp.stat().st_size / 1e6
+        pbar.set_postfix_str(f"{fp.name[:30]} ({size_mb:.1f}МБ)")
+        t0 = time.time()
+
         try:
-            docs = reader.load_file(
-                input_file=fpath,
-                file_metadata=_file_metadata,
-                file_extractor=reader.file_extractor,
-                errors="ignore",
-                raise_on_error=False,
-            )
-            documents.extend(docs)
+            if fp.suffix.lower() == ".pdf" and size_mb > _PDF_SIZE_LIMIT_MB:
+                text = _read_pdf_limited(fp, _MAX_PDF_PAGES)
+                if text.strip():
+                    meta = _file_metadata(str(fp))
+                    documents.append(Document(text=text, metadata=meta))
+                    print(f"Большой PDF ({size_mb:.0f}МБ): "
+                          f"прочитаны первые {_MAX_PDF_PAGES} стр. - {fp.name}")
+            else:
+                docs = reader.load_file(
+                    input_file=fpath,
+                    file_metadata=_file_metadata,
+                    file_extractor=reader.file_extractor,
+                    errors="ignore",
+                    raise_on_error=False,
+                )
+                documents.extend(docs)
+
+            dt = time.time() - t0
+            if dt > 15:
+                print(f"Медленный файл ({dt:.0f}с): {fp.name}")
         except Exception as e:
-            skipped.append(f"{Path(fpath).name}: {type(e).__name__}")
+            skipped.append(f"{fp.name}: {type(e).__name__}")
             continue
 
     if skipped:

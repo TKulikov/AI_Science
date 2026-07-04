@@ -4,6 +4,8 @@ data/raw/
 data/vector_store/
 data/raw_test/
 
+src/processing/scan_corpus.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
