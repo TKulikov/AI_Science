@@ -18,6 +18,7 @@ from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
 from llama_index.embeddings.yandexgpt import YandexGPTEmbedding
 from yandex_ai_studio_sdk import AIStudio
+import time
 
 try:
     import asyncio
@@ -187,32 +188,62 @@ def build_all_indexes_streaming(
         )
 
         # Оборачиваем внутреннюю обработку в tqdm, чтобы видеть, как двигаются эти 757 нод
+
         for j in tqdm(
             range(0, len(nodes), MICRO_BATCH_SIZE), desc=f"Разбор чанков батча {n}"
         ):
             micro_nodes = nodes[j : j + MICRO_BATCH_SIZE]
 
-            # Отправляем микро-порцию в граф
-            graph.insert_nodes(
-                micro_nodes,
-                kg_extractors=[kg_extractor],
-                embed_kg_nodes=False,
-                transformations=[],
-            )
+            # 1. СТАБИЛЬНАЯ ОТПРАВКА В ГРАФ С ЗАЩИТОЙ ОТ ПАДЕНИЯ ПО КВОТАМ
+            for single_node in micro_nodes:
+                success = False
+                retries = 0
 
-            # Отправляем микро-порцию в векторный индекс
-            vector.insert_nodes(micro_nodes, transformations=[])
+                while not success:
+                    try:
+                        graph.insert_nodes(
+                            [single_node],
+                            kg_extractors=[kg_extractor],
+                            embed_kg_nodes=False,
+                            transformations=[],
+                        )
+                        success = True
 
-            # Каждые несколько шагов или в конце микро-батча сбрасываем данные на диск
-            graph.storage_context.persist(persist_dir=str(graph_dir))
-            vector.storage_context.persist(persist_dir=str(vector_dir))
+                        # Маленькая микро-пауза (0.3 сек) защитит от мгновенного всплеска RPS
+                        time.sleep(0.3)
 
-            graph.storage_context.persist(persist_dir=str(graph_dir))
-            vector.storage_context.persist(persist_dir=str(vector_dir))
-        print(f"-> Батч {n} успешно обработан и сохранен на диск.")
-        del documents, nodes
-        gc.collect()
+                    except Exception as e:
+                        retries += 1
+                        # Если поймали ошибку сессии или лимитов токенов Яндекса
+                        print(
+                            f"\n[Внимание] Яндекс перегружен или исчерпан минутный лимит TPM. Ошибка: {e}"
+                        )
+                        wait_time = min(30 * retries, 60)  # Спим 30 секунд, затем 60
+                        print(
+                            f"Ожидаем {wait_time} сек. для сброса лимитов токенов (Попытка {retries})..."
+                        )
+                        time.sleep(wait_time)
 
+            # 2. ОТПРАВКА В ВЕКТОРНЫЙ ИНДЕКС
+            for single_node in micro_nodes:
+                success_vector = False
+                while not success_vector:
+                    try:
+                        vector.insert_nodes([single_node], transformations=[])
+                        success_vector = True
+                        time.sleep(0.1)
+                    except Exception as e:
+                        print(
+                            f"\n[Внимание] Ошибка эмбеддингов Яндекса: {e}. Ждем 30 сек..."
+                        )
+                        time.sleep(30)
+
+        # Синхронизируем прогресс на диск (база в безопасности)
+        graph.storage_context.persist(persist_dir=str(graph_dir))
+        vector.storage_context.persist(persist_dir=str(vector_dir))
+
+    del documents, nodes
+    gc.collect()
     try:
         graph.property_graph_store.save_networkx_graph(
             name=str(graph_dir / "graph.html")
