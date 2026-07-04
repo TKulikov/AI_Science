@@ -1,9 +1,15 @@
 llama-index
-llama-index-llms-ollama
-llama-index-embeddings-huggingface
+llama-index-embeddings-yandexgpt
 llama-index-readers-file
+yandex-ai-studio-sdk
 hdbscan
 scikit-learn
 numpy
 python-dotenv
+nest-asyncio
+python-pptx
 docx2txt
+openpyxl
+tqdm
+uvicorn
+fastapi
