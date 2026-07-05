@@ -1,0 +1,68 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Чат с LLM</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; }
+        #chat-container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #messages { height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 4px; }
+        .message { margin-bottom: 15px; padding: 10px; border-radius: 4px; }
+        .user { background-color: #e1f5fe; text-align: right; }
+        .bot { background-color: #f1f8e9; }
+        .sources { font-size: 0.85em; color: #555; margin-top: 5px; border-top: 1px dashed #ccc; padding-top: 5px; }
+        #input-container { display: flex; }
+        #user-input { flex-grow: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; margin-left: 10px; background-color: #0288d1; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #01579b; }
+    </style>
+</head>
+<body>
+
+<div id="chat-container">
+    <h2>Чат с AI</h2>
+    <div id="messages"></div>
+    <div id="input-container">
+        <input type="text" id="user-input" placeholder="Введите ваш запрос..." onkeydown="if(event.key === 'Enter') sendMessage()">
+        <button onclick="sendMessage()">Отправить</button>
+    </div>
+</div>
+
+<script>
+    async function sendMessage() {
+        const inputElement = document.getElementById('user-input');
+        const text = inputElement.value.trim();
+        if (!text) return;
+
+        const messagesContainer = document.getElementById('messages');
+
+        messagesContainer.innerHTML += `<div class="message user"><b>Вы:</b> ${text}</div>`;
+        inputElement.value = '';
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+        try {
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
+            });
+
+            const data = await response.json();
+
+            messagesContainer.innerHTML += `
+                <div class="message bot">
+                    <b>Бот:</b> ${data.ans}
+                    <div class="sources"><b>Источники:</b> ${data.src}</div>
+                </div>
+            `;
+        } catch (error) {
+            messagesContainer.innerHTML += `<div class="message bot" style="color: red;">Ошибка соединения с сервером.</div>`;
+        }
+
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+</script>
+</body>
+</html>
