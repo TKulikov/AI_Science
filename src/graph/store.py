@@ -53,7 +53,7 @@ VECTOR_PERSIST_DIR = Path("data/vector_store")
 NUM_WORKERS = int(os.getenv("KG_NUM_WORKERS", "8"))
 MAX_TRIPLETS = int(os.getenv("KG_MAX_TRIPLETS", "15"))
 EMBED_KG_NODES = os.getenv("KG_EMBED_NODES", "false").lower() == "true"
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "128"))
 MICRO_BATCH_SIZE = 5
 
@@ -122,7 +122,7 @@ def _extractor(llm: YandexLLM) -> DynamicLLMPathExtractor:
     return DynamicLLMPathExtractor(
         llm=llm,
         max_triplets_per_chunk=MAX_TRIPLETS,
-        num_workers=1,
+        num_workers=NUM_WORKERS,
         allowed_entity_types=None,
         allowed_relation_types=None,
         allowed_relation_props=None,
